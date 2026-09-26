@@ -1,0 +1,27 @@
+{
+  "description": "Атлас: доклад и сводка при старте сессии, отметка конца ответа. В проектах без .atlas/ хуки ничего не делают.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skills/atlas/scripts/atlas.py\" hook session-start --via plugin",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skills/atlas/scripts/atlas.py\" hook stop --via plugin",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

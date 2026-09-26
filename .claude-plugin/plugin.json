@@ -1,0 +1,17 @@
+{
+  "name": "atlas",
+  "displayName": "Атлас",
+  "version": "0.1.0",
+  "description": "Память и карта проекта, которую ведёт агент, а читает человек. Этап M0: доклад при входе, «Нужно от вас», карточка результата с тремя строками доверия, закладка, исправление ошибок — всё в чате.",
+  "author": {
+    "name": "Matrix6892"
+  },
+  "repository": "https://github.com/Matrix6892/Atlas_skill",
+  "keywords": [
+    "memory",
+    "project-map",
+    "handoff",
+    "sessions",
+    "atlas"
+  ]
+}
