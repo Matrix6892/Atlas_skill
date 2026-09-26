@@ -1,0 +1,14 @@
+{
+  "name": "atlas-marketplace",
+  "description": "Атлас — память и карта проекта для Claude Code",
+  "owner": {
+    "name": "Matrix6892"
+  },
+  "plugins": [
+    {
+      "name": "atlas",
+      "source": ".",
+      "description": "Память и карта проекта, которую ведёт агент, а читает человек (этап M0)"
+    }
+  ]
+}
