@@ -24,6 +24,7 @@ AGENT_NAMES = {
     "claude-code": "Claude Code",
     "claude": "Claude Code",
     "codex": "Codex",
+    "opencode": "opencode",
 }
 
 # Words from §4.2 that get a one-time explanation on first appearance in a session.

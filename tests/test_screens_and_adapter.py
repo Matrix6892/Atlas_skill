@@ -282,6 +282,63 @@ class InstallTests(ProjectCase):
         self.assertIn("в порядке", out)
 
 
+class CodexTests(ProjectCase):
+    def setUp(self):
+        super().setUp()
+        for k in ("CODEX_THREAD_ID", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"):
+            self.env.setdefault(k, os.environ.get(k))
+            os.environ.pop(k, None)
+        os.environ["CODEX_THREAD_ID"] = "thread-42"
+
+    def test_codex_is_recognised_with_its_thread_as_session(self):
+        receipt = {"ops": [{"op": "note.learned", "text": "записано из Codex"}]}
+        code, out = self.cli("write", stdin=json.dumps(receipt))
+        self.assertEqual(code, 0, out)
+        rec = [r for r in self.state().records if r["kind"] == "note.learned"][0]
+        self.assertEqual((rec["_agent"], rec["_session"]), ("codex", "thread-42"))
+
+    def test_connect_from_codex_keeps_claude_hooks_and_writes_agents_md(self):
+        settings = os.path.join(self.project, ".claude", "settings.local.json")
+        with open(settings, encoding="utf-8") as fh:
+            before = fh.read()
+        code, out = self.cli("connect")
+        self.assertEqual(code, 0, out)
+        with open(settings, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), before)
+        self.assertEqual(self.store.load_local("install.json")["hooks_mode"], "project")
+        with open(os.path.join(self.project, "AGENTS.md"), encoding="utf-8") as fh:
+            block = fh.read()
+        self.assertIn(" start`", block)
+        self.assertNotIn("--agent codex", block)
+        self.assertIn("обновление по команде", out)
+
+    def test_manual_start_shows_report_for_owner(self):
+        code, out = self.cli("start")
+        self.assertIn("ДОКЛАД ДЛЯ ВЛАДЕЛЬЦА", out)
+        self.assertIn("--session thread-42 --agent codex", out)
+
+
+class SkillFileTests(unittest.TestCase):
+    def test_frontmatter_is_strict_yaml(self):
+        # Claude Code drops every field when the frontmatter is not valid YAML.
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, os.pardir, "skills", "atlas", "SKILL.md"), encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertTrue(text.startswith("---\n"))
+        front = text.split("---\n")[1]
+        try:
+            import yaml
+        except ImportError:
+            for line in front.strip().splitlines():
+                key, _, value = line.partition(": ")
+                self.assertTrue(value.startswith('"') or ": " not in value, line)
+            return
+        data = yaml.safe_load(front)
+        self.assertEqual(data["name"], "atlas")
+        self.assertLessEqual(len(data["description"]), 1536)
+        self.assertIn("allowed-tools", data)
+
+
 class NoGitTests(ProjectCase):
     git = False
 

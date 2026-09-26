@@ -36,7 +36,20 @@ def default_agent():
         return os.environ["ATLAS_AGENT"]
     if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_ENTRYPOINT"):
         return "claude-code"
+    if os.environ.get("CODEX_THREAD_ID") or os.environ.get("CODEX_SANDBOX"):
+        return "codex"
     return "agent"
+
+
+def session_of(args):
+    """Session id: explicit flag, then the hook-provided value, then the
+    thread id that Codex passes to every command it runs."""
+    return (getattr(args, "session", None) or os.environ.get("ATLAS_SESSION_ID")
+            or os.environ.get("CODEX_THREAD_ID"))
+
+
+def agent_of(args):
+    return getattr(args, "agent", None) or default_agent()
 
 
 def open_store(args, must_exist=True):
@@ -97,7 +110,14 @@ def find_thread(st, value):
 # ----------------------------------------------------------------------
 def cmd_connect(args):
     project = os.path.abspath(args.project or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
-    res = connect(project, name=args.name, hooks=args.hooks, agents_md=args.agents_md)
+    hooks, agents_md = args.hooks, args.agents_md
+    if agent_of(args) != "claude-code":
+        # Codex, opencode and others: no Claude hooks to add; they follow the
+        # manual order from AGENTS.md. Hooks set up by Claude Code stay as they are.
+        if hooks == "auto":
+            hooks = "keep"
+        agents_md = True
+    res = connect(project, name=args.name, hooks=hooks, agents_md=agents_md)
     store = Store(project)
     st, _ = load(store)
     name = st.project_name or os.path.basename(project)
@@ -114,11 +134,13 @@ def cmd_connect(args):
     out("Не трогал:  код, ваши инструкции вне блока Атласа, настройки git.")
     if res["mode"] == "plugin":
         out("Хуки:       приходят из плагина Атласа.")
-    elif res["mode"] == "none":
-        out("Хуки:       не подключены — режим «обновление по команде».")
+    elif res["mode"] in ("none", "keep"):
+        out("Хуки:       у этого агента нет хуков Атласа — режим «обновление по команде»: "
+            "доклад и записи по инструкции в AGENTS.md.")
     out("Договорённость соблюдает агент; технически Атлас защищает только свои записи — "
         "команды агента вне Атласа он не останавливает (рекомендательный режим).")
-    out("Хуки начнут работать со следующей сессии Claude Code.")
+    if res["mode"] in ("plugin", "project"):
+        out("Хуки начнут работать со следующей сессии Claude Code.")
     return EXIT_OK
 
 
@@ -144,8 +166,8 @@ def cmd_start(args):
     if not cfg.get("enabled", True):
         out("Запись выключена, данные сохранены. Включить: «подключи Атлас».")
         return EXIT_OK
-    sid = args.session or os.environ.get("ATLAS_SESSION_ID") or new_id("manual")
-    agent = args.agent or default_agent()
+    sid = session_of(args) or new_id("manual")
+    agent = agent_of(args)
     res = session_start_output(store, sid, agent, "startup", "manual", command_line())
     out("=== ДОКЛАД ДЛЯ ВЛАДЕЛЬЦА (показать как есть) ===")
     out(res["report"])
@@ -160,7 +182,7 @@ def cmd_report(args):
     store = open_store(args)
     st, problem = load(store)
     gap_lines = [problem_line(problem)] if problem else []
-    out(views.report(st, args.session or os.environ.get("ATLAS_SESSION_ID"), gap_lines))
+    out(views.report(st, session_of(args), gap_lines))
     return EXIT_OK
 
 
@@ -177,7 +199,7 @@ def cmd_overview(args):
 def cmd_needs(args):
     store = open_store(args)
     st, problem = load(store)
-    session = args.session or os.environ.get("ATLAS_SESSION_ID")
+    session = session_of(args)
     terms = terms_for(store, session)
     briefs = store.load_local(os.path.join("manifests", "briefs.json"))
     out(views.needs_view(st, briefs, bool(st.active_frames()), terms))
@@ -188,7 +210,7 @@ def cmd_needs(args):
 def cmd_result(args):
     store = open_store(args)
     st, problem = load(store)
-    session = args.session or os.environ.get("ATLAS_SESSION_ID")
+    session = session_of(args)
     terms = terms_for(store, session)
     if args.target:
         r = st.results.get(args.target)
@@ -213,7 +235,7 @@ def cmd_result(args):
 def cmd_topic(args):
     store = open_store(args)
     st, problem = load(store)
-    session = args.session or os.environ.get("ATLAS_SESSION_ID")
+    session = session_of(args)
     terms = terms_for(store, session)
     t = find_thread(st, args.thread)
     out(views.topic_view(st, t, full=args.all, terms=terms))
@@ -293,7 +315,7 @@ def cmd_find(args):
 def cmd_brief(args):
     store = open_store(args)
     st, problem = load(store)
-    session = args.session or os.environ.get("ATLAS_SESSION_ID")
+    session = session_of(args)
     local = store.load_local("install.json")
     mode = "hooks" if local.get("hooks_mode") in ("plugin", "project") else "manual"
     fn = build_full if args.full else build_brief
@@ -304,7 +326,7 @@ def cmd_brief(args):
     if session:
         briefs = store.load_local(os.path.join("manifests", "briefs.json"))
         seen = dict(manifest["decisions"])
-        seen["_agent"] = default_agent()
+        seen["_agent"] = agent_of(args)
         briefs[session] = seen
         store.save_local(os.path.join("manifests", "briefs.json"), briefs)
     return EXIT_OK
@@ -369,8 +391,8 @@ def cmd_write(args):
         receipt = json.loads(raw)
     except ValueError as exc:
         raise AtlasError("Квитанция не читается как JSON: %s" % exc)
-    session = args.session or os.environ.get("ATLAS_SESSION_ID")
-    ctx = Context(store.project, args.agent or default_agent(), session)
+    session = session_of(args)
+    ctx = Context(store.project, agent_of(args), session)
     res = apply_receipt(store, receipt, ctx, dry_run=args.dry_run)
     text, code = render_write(res)
     out(text)
@@ -440,8 +462,8 @@ def cmd_check(args):
     took = time.time() - started
     tail = _scrub("\n".join(output.strip().splitlines()[-15:]))
     outcome = "passed" if code == 0 else ("failed" if code is not None else "could_not_check")
-    session = args.session or os.environ.get("ATLAS_SESSION_ID")
-    ctx = Context(store.project, args.agent or default_agent(), session)
+    session = session_of(args)
+    ctx = Context(store.project, agent_of(args), session)
     receipt_crits = []
     for c in crits:
         crit = st.criteria.get(c)
@@ -636,7 +658,7 @@ def cmd_redact(args):
                 rec["source"]["quote"] = marker
         for tx in by_tx.values():
             store.rewrite_transaction(tx)
-    ctx = Context(store.project, default_agent(), args.session or os.environ.get("ATLAS_SESSION_ID"))
+    ctx = Context(store.project, agent_of(args), session_of(args))
     write_core(store, [("redaction", {"target": target, "records": [r["id"] for _, r in hits], "marker": marker},
                         {"type": "owner_message", "quote": "подтверждено командой redact --confirm"})], ctx, via="redact")
     out("Удалено из Атласа: очищено %s, в журнале оставлен безопасный маркер без самого текста." % ru.count_words(
@@ -720,7 +742,7 @@ def build_parser():
 
     s = sub.add_parser("connect", help="подключить Атлас к проекту (Э9)")
     s.add_argument("--name", help="название проекта словами владельца")
-    s.add_argument("--hooks", choices=("auto", "project", "plugin", "none"), default="auto")
+    s.add_argument("--hooks", choices=("auto", "project", "plugin", "none", "keep"), default="auto")
     s.add_argument("--agents-md", action="store_true", help="добавить блок ручного режима в AGENTS.md (Codex)")
     s.set_defaults(fn=cmd_connect)
     sub.add_parser("disconnect", help="отключить Атлас; данные остаются").set_defaults(fn=cmd_disconnect)
