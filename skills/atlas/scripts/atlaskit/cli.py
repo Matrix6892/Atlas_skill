@@ -110,14 +110,15 @@ def find_thread(st, value):
 # ----------------------------------------------------------------------
 def cmd_connect(args):
     project = os.path.abspath(args.project or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
-    hooks, agents_md = args.hooks, args.agents_md
+    hooks, agents_md, claude_md = args.hooks, args.agents_md, True
     if agent_of(args) != "claude-code":
         # Codex, opencode and others: no Claude hooks to add; they follow the
         # manual order from AGENTS.md. Hooks set up by Claude Code stay as they are.
         if hooks == "auto":
             hooks = "keep"
         agents_md = True
-    res = connect(project, name=args.name, hooks=hooks, agents_md=agents_md)
+        claude_md = False  # CLAUDE.md gets the block only if it already exists
+    res = connect(project, name=args.name, hooks=hooks, agents_md=agents_md, claude_md=claude_md)
     store = Store(project)
     st, _ = load(store)
     name = st.project_name or os.path.basename(project)

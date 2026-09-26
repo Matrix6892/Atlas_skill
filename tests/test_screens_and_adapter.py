@@ -312,6 +312,15 @@ class CodexTests(ProjectCase):
         self.assertNotIn("--agent codex", block)
         self.assertIn("обновление по команде", out)
 
+    def test_connect_from_codex_does_not_create_claude_md(self):
+        import tempfile, shutil
+        other = tempfile.mkdtemp(prefix="atlas-codex-")
+        self.addCleanup(shutil.rmtree, other, True)
+        code, out = self.cli("--project", other, "connect")
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.exists(os.path.join(other, "CLAUDE.md")))
+        self.assertTrue(os.path.exists(os.path.join(other, "AGENTS.md")))
+
     def test_manual_start_shows_report_for_owner(self):
         code, out = self.cli("start")
         self.assertIn("ДОКЛАД ДЛЯ ВЛАДЕЛЬЦА", out)

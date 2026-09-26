@@ -184,7 +184,7 @@ def _git_ignored(project, rel):
 
 
 # ----------------------------------------------------------------------
-def connect(project, name=None, hooks="auto", agents_md=False):
+def connect(project, name=None, hooks="auto", agents_md=False, claude_md=True):
     from .ops import Context, write_core  # local import to avoid a cycle
 
     store = Store(project)
@@ -204,9 +204,11 @@ def connect(project, name=None, hooks="auto", agents_md=False):
             cfg["enabled"] = True
             store.save_config(cfg)
             changes.append("снова включил запись в .atlas/ (данные были сохранены)")
-    action = _upsert_block(os.path.join(project, "CLAUDE.md"), CLAUDE_BLOCK)
-    if action != "без изменений":
-        changes.append("%s блок Атласа в CLAUDE.md (инструкции агента)" % action)
+    claude_path = os.path.join(project, "CLAUDE.md")
+    if claude_md or os.path.exists(claude_path):
+        action = _upsert_block(claude_path, CLAUDE_BLOCK)
+        if action != "без изменений":
+            changes.append("%s блок Атласа в CLAUDE.md (инструкции агента)" % action)
     if agents_md:
         action = _upsert_block(os.path.join(project, "AGENTS.md"), agents_block())
         if action != "без изменений":
