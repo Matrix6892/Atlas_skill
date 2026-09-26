@@ -143,7 +143,7 @@ class BriefTests(ProjectCase):
         st = self.state()
         text, manifest = build(st, "atlas", "s1", st.last_tx)
         self.assertIn("не трогаю: сайт и настоящие данные", text)
-        self.assertIn("не поместились в сводку", text)
+        self.assertIn("не поместилось в сводку", text)
         self.assertLess(len(text), 4600)
         self.assertTrue(manifest["truncated"] > 0)
 

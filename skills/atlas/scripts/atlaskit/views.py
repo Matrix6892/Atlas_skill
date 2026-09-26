@@ -173,7 +173,17 @@ def criterion_status(st, t, c, latest):
 
 # ----------------------------------------------------------------------
 # next step (Appendix D, simplified for M0)
+def _decision_step(d):
+    return {"text": "ответить: %s" % decision_name(d), "why": None, "source": "needs", "kind": "answer_decision"}
+
+
 def next_step(st):
+    # A risky or blocking question outranks the bookmark's plan (R16, C.3):
+    # the bookmark is re-checked against current constraints, it does not win
+    # by default.
+    urgent = [i for i in st.needs() if i["type"] == "decision" and i["prio"] <= 1]
+    if urgent:
+        return _decision_step(urgent[0]["obj"])
     bm = st.last_bookmark()
     if bm and bm.get("next"):
         n = bm["next"]
@@ -198,9 +208,8 @@ def next_step(st):
             return {"text": "проверить %s самому, %s%s" % (
                 result_name(st, r), dur, "; инструкция готова" if has_steps else "; инструкцию проверки агент ещё не написал"),
                 "why": None, "source": "needs", "kind": "check_result"}
-        if item["type"] == "decision" and item["prio"] <= 2:
-            d = item["obj"]
-            return {"text": "ответить: %s" % decision_name(d), "why": None, "source": "needs"}
+        if item["type"] == "decision" and item["prio"] <= 3:
+            return _decision_step(item["obj"])
     active = [t for t in st.live_threads() if st.view_state(t) == "active"]
     if active:
         t = sorted(active, key=lambda t: t.get("progress_at") or "")[-1]
@@ -562,6 +571,9 @@ def topic_view(st, t, full=False, terms=None):
         lines.append("ДАЛЬШЕ   Продолжить работу; где остановились — в истории выше.")
     elif vstate == "planned":
         lines.append("ДАЛЬШЕ   Взять в работу — скажите «берём %s»." % title_lc(t))
+    elif vstate == "closed":
+        lines.append("ДАЛЬШЕ   Всё согласованное принято — продолжать не нужно. Новая работа по теме начнётся "
+                     "с нового условия готовности.")
     elif vstate == "candidate":
         lines.append("ДАЛЬШЕ   Это ваша тема? Скажите «да, это тема» или «это не тема».")
     else:
@@ -770,7 +782,7 @@ def overview(st, gaps_text=None, snapshot=None):
         head += " · условия цели: проверено %d из %d · принято %d" % (passed, len(goal_crits), accepted)
     lines.append("")
     lines.append(head)
-    order = ("presented", "active", "planned", "paused", "frozen", "candidate", "released")
+    order = ("presented", "active", "planned", "paused", "frozen", "candidate", "closed", "released")
     limit = int(st.settings.get("wip_limit", 3))
     for state in order:
         group = [t for t in threads if st.view_state(t) == state]

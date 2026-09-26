@@ -69,6 +69,20 @@ def looks_secret(value):
     return False
 
 
+def scrub_secrets(value):
+    """One privacy policy for every sink (R05): replace secret-looking text,
+    recursively, with a marker. Used where the core itself writes or prints."""
+    if isinstance(value, str):
+        for p in SECRET_PATTERNS:
+            value = p.sub("[скрыто]", value)
+        return value
+    if isinstance(value, dict):
+        return {k: scrub_secrets(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [scrub_secrets(v) for v in value]
+    return value
+
+
 def norm(text):
     return re.sub(r"\s+", " ", (text or "").strip().lower().replace("ё", "е")).strip(" .!?")
 
@@ -842,9 +856,17 @@ class Applier:
             # run observed by the core (`atlas.py check`) is automated_run.
             method = "agent_report"
             downgraded = True
+        if method == "external":
+            if not self.text(op, "detail"):
+                raise OpError("для независимой проверки укажите detail: кто проверял и в какой области")
+            # B.2: independence comes from how the evidence arrived, not from a
+            # label. In M0 the only route is the owner relaying it in their own
+            # words; the agent's story about an external checker stays a
+            # report of the agent.
+            if not ((op.get("source") or {}) if isinstance(op.get("source"), dict) else {"quote": op.get("source")}).get("quote"):
+                method = "agent_report"
+                downgraded = True
         src = self.source(op, method == "owner_manual", "ручная проверка владельца")
-        if method == "external" and not self.text(op, "detail"):
-            raise OpError("для независимой проверки укажите detail: кто проверял и в какой области")
         fp = self.ctx.fingerprint() if method in ("owner_manual", "external") else None
         vid = new_id("ver")
         self.emit("verify", {
@@ -860,7 +882,9 @@ class Applier:
         line = "«%s» r%d: %s (%s)" % (t["title"], r["version"], what, {
             "owner_manual": "вами вручную", "agent_report": "со слов агента — «проверено» от этого не растёт",
             "external": "независимая проверка"}[method])
-        if downgraded:
+        if downgraded and op.get("method") == "external":
+            line += "; о внешней проверке сообщил агент, а не владелец — независимой она не считается"
+        elif downgraded:
             line += "; запуск не наблюдался ядром — для «проверено тестом» используйте atlas.py check"
         rfp = (r.get("fingerprint") or {}).get("hash")
         if fp and rfp and fp.get("hash") != rfp:
@@ -996,14 +1020,56 @@ class Applier:
         return "закладка %s" % bid
 
     # ----- corrections (Э11, B.6) ---------------------------------------
-    EDITABLE = {"title", "why", "text", "question", "kind", "stopped_at"}
+    # Fields a correction may change, per object type (by ID prefix). Anything
+    # else goes through its typed operation (decision.supersede,
+    # criterion.revise, thread.state …) with that operation's own checks.
+    EDITABLE = {
+        "th": {"title", "why"},
+        "cr": {"text"},
+        "park": {"text", "kind"},
+        "dec": {"question"},
+        "note": {"text"},
+        "try": {"approach", "learned"},
+        "bm": {"stopped_at"},
+    }
+    # Records that exist only because the owner agreed: correcting them in any
+    # way needs the owner's words (rule 1, B.4) — a correction must not be a
+    # side door around consent.
+    CONSENT_KINDS = {"decision.decide", "decision.delegate", "decision.supersede", "decision.withdraw", "accept",
+                     "frame.agree", "rule.confirm", "rule.revoke", "goal.set", "settings.set", "park.promote",
+                     "park.release", "park.restore", "criterion.withdraw"}
+
+    def _needs_owner(self, obj, rec, action):
+        oid = (obj or {}).get("id", "") or ""
+        # Hiding a check or a readiness condition changes what «проверено»
+        # means; only the owner may declare such a record a mistake.
+        if action in ("withdraw", "link") and oid.split("-")[0] in ("cr", "ver", "res"):
+            return True
+        if rec is not None and rec["kind"] in ("verify", "criterion.add", "result.present"):
+            return True
+        if rec is not None:
+            if rec["kind"] in self.CONSENT_KINDS:
+                return True
+            return rec["kind"] == "verify" and rec.get("data", {}).get("method") == "owner_manual"
+        prefix = oid.split("-")[0]
+        if prefix == "dec":
+            return obj["status"] != "proposed"
+        if prefix in ("acc", "fr", "goal"):
+            return True
+        if prefix == "rule":
+            return obj["status"] != "proposed"
+        if prefix == "ver":
+            return obj.get("method") == "owner_manual"
+        return (obj.get("source") or {}).get("type") == "owner_message"
 
     def op_correct(self, op):
         target = op.get("target")
         if isinstance(target, int) or (isinstance(target, str) and re.fullmatch(r"(?:вопрос|решение)?\s*\d+", target.strip())):
             target = self.decision(target)["id"]
+        if not isinstance(target, str):
+            raise OpError("target — ID объекта или записи, либо номер вопроса")
         oid = self._ref(target, "") or target
-        obj = self.st.lookup(oid) if isinstance(oid, str) else None
+        obj = self.st.lookup(oid)
         rec = None
         if obj is None:
             rec = next((r for r in self.st.records if r.get("id") == oid), None)
@@ -1014,32 +1080,58 @@ class Applier:
         action = self.choice(op, "action", ("withdraw", "edit", "link"))
         was = self.text(op, "was", True, 500)
         becomes = self.text(op, "becomes", True, 500)
+        owner = self._needs_owner(obj, rec, action)
+        src = self.source(op, owner, "исправление записи, которая держится на согласии владельца")
         data = {"correction_id": new_id("fix"), "target": oid, "action": action, "was": was, "becomes": becomes,
                 "code_changed": False}
         if action == "edit":
             edit = op.get("edit")
             if obj is None or not isinstance(edit, dict) or not edit:
                 raise OpError("для edit нужен объект и поле edit {поле: значение}")
-            bad = set(edit) - self.EDITABLE
+            prefix = oid.split("-")[0]
+            if prefix == "dec" and obj["status"] != "proposed":
+                raise OpError("действующее решение не переписывают исправлением: новое решение заменяет старое "
+                              "через decision.supersede со словами владельца; прежнее остаётся в истории")
+            allowed = self.EDITABLE.get(prefix, set())
+            bad = set(edit) - allowed
             if bad:
-                raise OpError("исправлять можно поля: %s" % ", ".join(sorted(self.EDITABLE)))
-            data["edit"] = edit
+                raise OpError("у этого объекта исправлением можно менять только: %s" % (
+                    ", ".join(sorted(allowed)) or "ничего — используйте его собственную операцию"))
+            clean = {}
+            for key, value in edit.items():
+                if not isinstance(value, str) or not value.strip():
+                    raise OpError("edit.%s — непустой текст" % key)
+                if len(value) > 500:
+                    raise OpError("edit.%s длиннее 500 знаков" % key)
+                if key == "kind" and value not in ("idea", "question"):
+                    raise OpError("edit.kind: idea или question")
+                clean[key] = value.strip()
+            if looks_secret(clean):
+                raise OpError("в исправлении похоже на секрет — не записываю")
+            data["edit"] = clean
+            if prefix == "cr":
+                # Unknown degree of change is treated as a change of meaning:
+                # earlier checks stop applying (B.5). Only an explicit
+                # substantive=false keeps them (a typo).
+                data["substantive"] = op.get("substantive") is not False
         if action == "link":
             link = op.get("link_to")
             link_obj = None
             if link is not None:
-                link_id = self._ref(link, "") or link
                 if isinstance(link, int) or (isinstance(link, str) and link.strip().isdigit()):
                     link_obj = self.decision(link)
                 else:
-                    link_obj = self.st.lookup(link_id)
+                    link_obj = self.st.lookup(self._ref(link, "") or link)
             if not link_obj or link_obj.get("error"):
                 raise OpError("link_to — существующий объект, на который нужно сослаться")
             data["link_to"] = link_obj["id"]
         data["affected"] = self._affected(obj, rec)
-        self.emit("correct", data, self.source(op, False, ""))
-        return "исправлено: было «%s» → стало «%s». Затронуто: %s. Код это не меняет" % (
+        self.emit("correct", data, src)
+        line = "исправлено: было «%s» → стало «%s». Затронуто: %s. Код это не меняет" % (
             was, becomes, ", ".join(data["affected"]) or "только эта запись")
+        if data.get("substantive"):
+            line += ". Условие изменилось по смыслу — прежние проверки к нему не относятся"
+        return line
 
     def _affected(self, obj, rec):
         out = ["доклад"]
@@ -1079,7 +1171,11 @@ def apply_receipt(store, receipt, ctx, dry_run=False):
         raise AtlasError("квитанция — JSON-объект с непустым списком \"ops\"")
     if len(receipt["ops"]) > 100:
         raise AtlasError("в одной квитанции больше 100 операций — разбейте")
-    receipt_hash = sha256_text(canonical_json(receipt["ops"]))
+    # «The same content» covers everything that changes meaning: the ops, the
+    # all-or-nothing mode and the preconditions (E.2).
+    receipt_hash = sha256_text(canonical_json({"ops": receipt["ops"],
+                                               "all_or_nothing": bool(receipt.get("all_or_nothing")),
+                                               "base_snapshot": receipt.get("base_snapshot")}))
     key = receipt.get("key")
     if key is not None and (not isinstance(key, str) or not key.strip() or len(key) > 200):
         raise AtlasError("key — непустая строка до 200 знаков")
@@ -1096,7 +1192,12 @@ def apply_receipt(store, receipt, ctx, dry_run=False):
         if key and key in st.receipts:
             prev = st.receipts[key]
             if prev["hash"] == receipt_hash:
-                return {"repeat": True, "tx": prev["tx"], "applied": [], "failed": [], "refs": {}}
+                # Idempotency returns the original outcome, not just «no
+                # duplicates»: a partial write stays partial, IDs come back.
+                outcome = prev.get("outcome") or {}
+                return {"repeat": True, "tx": prev["tx"],
+                        "applied": [tuple(a) for a in outcome.get("applied", [])],
+                        "failed": list(outcome.get("failed", [])), "refs": dict(outcome.get("refs", {}))}
             raise AtlasError("Конфликт протокола: ключ «%s» уже использован для другого содержимого "
                              "(запись №%d). Ничего не изменено." % (key, prev["tx"]))
         tx_no = st.last_tx + 1
@@ -1171,7 +1272,9 @@ def apply_receipt(store, receipt, ctx, dry_run=False):
             clean.append({k: v for k, v in r.items() if not k.startswith("_")})
         tx = {"tx": tx_no, "id": new_id("tx"), "at": ctx.now,
               "origin": {"agent": ctx.agent, "session": ctx.session, "receipt_key": key,
-                         "receipt_hash": receipt_hash, "via": "write"},
+                         "receipt_hash": receipt_hash, "via": "write", "fingerprint": ctx.fingerprint(),
+                         "outcome": {"applied": [list(a) for a in sorted(applied)], "failed": failed,
+                                     "refs": refs}},
               "records": clean}
         store.publish_transaction(tx)
         result["tx"] = tx_no
@@ -1188,12 +1291,14 @@ def write_core(store, records, ctx, via="core"):
         tx_no = st.last_tx + 1
         clean = []
         for kind, data, source in records:
-            rec = {"id": new_id("rec"), "kind": kind, "data": data, "at": ctx.now,
-                   "source": source or {"type": "core"}}
+            # Core-origin records pass the same privacy gate as receipts.
+            rec = {"id": new_id("rec"), "kind": kind, "data": scrub_secrets(data), "at": ctx.now,
+                   "source": scrub_secrets(source or {"type": "core"})}
             clean.append(rec)
-        tx = {"tx": tx_no, "id": new_id("tx"), "at": ctx.now,
-              "origin": {"agent": ctx.agent, "session": ctx.session, "receipt_key": None,
-                         "receipt_hash": None, "via": via},
-              "records": clean}
+        origin = {"agent": ctx.agent, "session": ctx.session, "receipt_key": None,
+                  "receipt_hash": None, "via": via}
+        if via == "check":
+            origin["fingerprint"] = ctx.fingerprint()
+        tx = {"tx": tx_no, "id": new_id("tx"), "at": ctx.now, "origin": origin, "records": clean}
         store.publish_transaction(tx)
         return tx_no

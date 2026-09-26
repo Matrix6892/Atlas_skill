@@ -1,6 +1,7 @@
 """Command line: `python3 atlas.py <command>`. Owner-facing output is Russian."""
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -12,10 +13,10 @@ from . import VERSION, SCHEMA_VERSION
 from . import ru
 from . import views
 from .brief import build as build_brief, build_full
-from .hooks import run_hook, session_start_output, prefs as load_prefs, gap_unknown_lines, _session_manifest, \
+from .hooks import run_hook, session_start_output, prefs as load_prefs, gap_unknown_lines, report_gap_lines, _session_manifest, \
     _save_session_manifest
 from .install import connect, disconnect, changes_report, command_line, detect_hooks_mode, script_path
-from .ops import Context, apply_receipt, write_core, load_state, SECRET_PATTERNS, norm
+from .ops import Context, apply_receipt, write_core, load_state, SECRET_PATTERNS, norm, scrub_secrets
 from .store import Store, AtlasError, NotConnected, find_project, worktree_fingerprint, git_available, git_recent, \
     new_id
 
@@ -182,7 +183,7 @@ def cmd_start(args):
 def cmd_report(args):
     store = open_store(args)
     st, problem = load(store)
-    gap_lines = [problem_line(problem)] if problem else []
+    gap_lines = ([problem_line(problem)] if problem else []) + report_gap_lines(st)
     out(views.report(st, session_of(args), gap_lines))
     return EXIT_OK
 
@@ -349,11 +350,10 @@ def cmd_show(args):
 
 def render_write(res):
     lines = []
-    if res.get("repeat"):
-        lines.append("Повтор квитанции: уже записано (запись №%d). Ничего не удвоено." % res["tx"])
-        return "\n".join(lines), EXIT_OK
     applied, failed = res["applied"], res["failed"]
-    if res.get("dry_run"):
+    if res.get("repeat"):
+        lines.append("Повтор квитанции: она уже была принята (запись №%d), ничего не удвоено. Прежний результат:" % res["tx"])
+    elif res.get("dry_run"):
         lines.append("Проверка без записи — было бы записано:")
     elif res.get("tx"):
         lines.append("Записано, запись подтверждена (снимок %d):" % res["tx"])
@@ -397,7 +397,7 @@ def cmd_write(args):
     res = apply_receipt(store, receipt, ctx, dry_run=args.dry_run)
     text, code = render_write(res)
     out(text)
-    if args.file and not args.dry_run and (res.get("tx") or res.get("repeat")):
+    if args.file and not args.dry_run and (res.get("tx") or res.get("repeat")) and not res.get("failed"):
         # A receipt dropped into .atlas/.local/inbox/ is consumed once written.
         path = os.path.abspath(args.file)
         if os.path.dirname(path) == os.path.abspath(store.inbox):
@@ -405,7 +405,9 @@ def cmd_write(args):
                 os.remove(path)
             except OSError:
                 pass
-    if res.get("tx") and not res.get("dry_run"):
+    if args.file and res.get("failed") and (res.get("tx") or res.get("repeat")):
+        out("Квитанция оставлена в inbox: неприменённое исправьте новой квитанцией с новым ключом.")
+    if res.get("tx") and not res.get("dry_run") and not res.get("repeat"):
         st, _ = load(store)
         kinds = [op.get("op") for op in receipt["ops"] if isinstance(op, dict)]
         if "bookmark.save" in kinds:
@@ -418,25 +420,30 @@ def cmd_write(args):
     return code
 
 
-def _scrub(text):
-    for p in SECRET_PATTERNS:
-        text = p.sub("[скрыто]", text)
-    return text
-
-
 def cmd_check(args):
     """Observed run (B.2): the core itself runs the command and records the
-    exit code — the only way to get «проверено тестом»."""
+    exit code — the only way to get «проверено тестом».
+
+    Lifecycle (R07): everything is validated BEFORE the process starts —
+    project enabled, result presented and not withdrawn, criteria inside the
+    version. The command line is stored and shown only scrubbed (R05). The
+    state is fingerprinted before and after; a run that changed files is
+    marked, not silently bound to the result."""
     store = open_store(args)
+    if not store.load_config().get("enabled", True):
+        raise AtlasError("Запись выключена (Атлас отключён): проверку не запускаю и не записываю. "
+                         "Включить: «подключи Атлас».")
     if not args.cmd:
         raise AtlasError("Укажите команду проверки после «--», например: atlas.py check --thread «Вход» --criteria cr-… -- npm test")
     cmd = args.cmd[1:] if args.cmd[0] == "--" else args.cmd
+    if not cmd:
+        raise AtlasError("Пустая команда проверки.")
     st, problem = load(store)
     if problem:
         raise AtlasError(problem_line(problem))
     if args.result:
         r = st.results.get(args.result)
-        if not r:
+        if not r or r.get("error"):
             raise AtlasError("Результат «%s» не найден." % args.result)
     else:
         if not args.thread:
@@ -446,9 +453,20 @@ def cmd_check(args):
         if not r:
             raise AtlasError("У темы «%s» нет предъявленного результата. Сначала result.present, потом проверка — "
                              "она привязывается к версии." % t["title"])
+    if r.get("withdrawn"):
+        raise AtlasError("Результат r%d отозван — проверять нечего." % r["version"])
     crits = [c.strip() for c in (args.criteria or "").split(",") if c.strip()]
     if not crits:
         raise AtlasError("Укажите --criteria: какие условия готовности проверяет эта команда (не больше, чем она проверяет).")
+    in_version = {e["id"] for e in r["criteria"]}
+    receipt_crits = []
+    for c in crits:
+        crit = st.criteria.get(c)
+        if not crit or crit.get("error") or crit["withdrawn"] or crit["id"] not in in_version:
+            raise AtlasError("Условие «%s» не входит в версию r%d — команду не запускаю." % (c, r["version"]))
+        receipt_crits.append({"id": crit["id"], "scope_rev": crit["scope_rev"]})
+    shown_cmd = scrub_secrets(" ".join(cmd))[:500]
+    env = scrub_secrets(args.env or "")
     fp_before = worktree_fingerprint(store.project)
     started = time.time()
     try:
@@ -461,33 +479,32 @@ def cmd_check(args):
     except OSError as exc:
         code, output = None, "команда не запустилась: %s" % exc
     took = time.time() - started
-    tail = _scrub("\n".join(output.strip().splitlines()[-15:]))
+    fp_after = worktree_fingerprint(store.project)
+    changed = bool(fp_before and fp_after and fp_before.get("hash") != fp_after.get("hash"))
+    tail = scrub_secrets("\n".join(output.strip().splitlines()[-15:]))
     outcome = "passed" if code == 0 else ("failed" if code is not None else "could_not_check")
-    session = session_of(args)
-    ctx = Context(store.project, agent_of(args), session)
-    receipt_crits = []
-    for c in crits:
-        crit = st.criteria.get(c)
-        if not crit or crit["id"] not in [e["id"] for e in r["criteria"]]:
-            raise AtlasError("Условие «%s» не входит в версию r%d." % (c, r["version"]))
-        receipt_crits.append({"id": crit["id"], "scope_rev": crit["scope_rev"]})
+    ctx = Context(store.project, agent_of(args), session_of(args))
     data = {"verification_id": new_id("ver"), "result_id": r["id"], "thread_id": r["thread_id"],
             "criteria": receipt_crits, "method": "automated_run", "outcome": outcome,
-            "environment": args.env, "limitations": [], "detail": None, "fingerprint": fp_before,
-            "observed": {"command": " ".join(cmd)[:500], "exit_code": code, "seconds": round(took, 1),
+            "environment": env, "limitations": [], "detail": None, "fingerprint": fp_before,
+            "fingerprint_after": fp_after, "changed_during_run": changed,
+            "observed": {"command": shown_cmd, "exit_code": code, "seconds": round(took, 1),
                          "tail": tail[-2000:], "observer": "atlas-core"}}
     write_core(store, [("verify", data, {"type": "core", "observer": "atlas-core"})], ctx, via="check")
     t = st.threads[r["thread_id"]]
     word = {"passed": "проверено тестом", "failed": "тест не прошёл — тема возвращается в работу",
             "could_not_check": "проверить не удалось (провалом не считается)"}[outcome]
     out("Запуск наблюдался ядром Атласа: `%s` → %s за %.0f с." % (
-        " ".join(cmd), ("код %d" % code) if code is not None else "без кода завершения", took))
+        shown_cmd, ("код %d" % code) if code is not None else "без кода завершения", took))
     out("Записано: «%s» (версия r%d) — %s: %s." % (t["title"], r["version"], word,
                                                  "; ".join(st.criteria[c["id"]]["text"] for c in receipt_crits)))
     rfp = (r.get("fingerprint") or {}).get("hash")
     if rfp and fp_before and rfp != fp_before.get("hash"):
         out("Внимание: код менялся после предъявления r%d — проверка относится к текущему состоянию, "
             "к r%d она не засчитается. Предъявите новую версию (result.present) и проверьте её." % (r["version"], r["version"]))
+    if changed:
+        out("Внимание: сама проверка изменила файлы проекта — к версии r%d она не засчитается, "
+            "пока не станет ясно, что изменилось." % r["version"])
     if outcome != "passed":
         out("Хвост вывода:\n" + tail)
     return EXIT_OK if outcome == "passed" else EXIT_PARTIAL
@@ -617,53 +634,123 @@ def cmd_export(args):
     return EXIT_OK
 
 
+# The field that names the object a record creates or changes (for redact:
+# delete the object's own records, not every record that mentions it).
+PRIMARY_KEY = {
+    "goal": "goal_id", "thread": "thread_id", "criterion": "criterion_id", "note": "note_id",
+    "attempt": "attempt_id", "decision": "decision_id", "park": "item_id", "result": "result_id",
+    "verify": "verification_id", "accept": "acceptance_id", "frame": "frame_id", "rule": "rule_id",
+    "bookmark": "bookmark_id", "capture": "gap_id",
+}
+# Structure, not content: kept by redaction so links and projections still work.
+STRUCT_KEYS = {"kind", "state", "method", "outcome", "status", "urgency", "risk", "class", "action", "to",
+               "from", "observer", "exit_code", "version", "number", "scope_rev", "seconds", "head", "hash",
+               "dirty", "type", "agent", "session", "at", "created", "delegated", "substantive", "standing",
+               "mode", "code_changed", "over_limit", "goal_related", "observable", "new_approach",
+               "changed_during_run", "downgraded", "can_defer", "auto", "op", "group", "index", "refs"}
+ID_RE = re.compile(r"^(?:th|cr|dec|park|res|ver|acc|fr|rule|note|try|bm|fix|gap|goal|rec|tx)-[a-z0-9]{8}$")
+
+
+def _redact_value(value, marker, removed, key=None):
+    if key in STRUCT_KEYS or key and key.endswith("_id"):
+        return value
+    if isinstance(value, str):
+        if ID_RE.match(value) or value == marker:
+            return value
+        if len(value.strip()) >= 3:
+            removed.append(value)
+        return marker
+    if isinstance(value, list):
+        return [_redact_value(v, marker, removed, key if not isinstance(v, (dict, list)) else None) for v in value]
+    if isinstance(value, dict):
+        return {k: _redact_value(v, marker, removed, k) for k, v in value.items()}
+    return value
+
+
+def _redact_hits(txs, target):
+    hits = []
+    for tx in txs:
+        for rec in tx["records"]:
+            d = rec.get("data", {})
+            primary = PRIMARY_KEY.get(rec["kind"].split(".")[0])
+            if (rec.get("id") == target or (primary and d.get(primary) == target)
+                    or (rec["kind"] == "correct" and d.get("target") == target)):
+                hits.append((tx, rec))
+    return hits
+
+
 def cmd_redact(args):
-    """Sensitive content removal (F.3): the one exception to immutability."""
+    """Sensitive content removal (F.3): the one exception to immutability.
+
+    Removes every text of the object's own records at any depth (R06), keeps
+    IDs, types and links, then re-reads the records to check that none of the
+    removed text is left. Limits are named: git history, exports, what was
+    already sent to the model."""
     store = open_store(args)
     st, problem = load(store)
     if problem:
         raise AtlasError(problem_line(problem))
     target = args.target
     txs, _ = store.load_transactions()
-    hits = []
-    for tx in txs:
-        for rec in tx["records"]:
-            d = rec.get("data", {})
-            ids = {rec.get("id")} | {v for k, v in d.items() if k.endswith("_id") and isinstance(v, str)}
-            if target in ids:
-                hits.append((tx, rec))
+    hits = _redact_hits(txs, target)
     if not hits:
-        raise AtlasError("Не нашёл записей с «%s»." % target)
+        raise AtlasError("Не нашёл записей объекта «%s»." % target)
     tracked = subprocess.run(["git", "-C", store.project, "ls-files", "--", ".atlas/data/records/"],
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout.decode().strip()
+    exports = sorted(glob.glob(os.path.join(store.root, "export", "*.md")))
     out("Где это лежит:")
     for tx, rec in hits:
         out("  .atlas/data/records/%06d.json — запись %s (%s)" % (tx["tx"], rec["id"], rec["kind"]))
-    out("  доклады и сводки — пересоберутся без этого текста")
-    out("Удалить не могу: %sуже отправленное агенту и провайдеру модели; внешние экспорты и резервные копии." % (
+    out("  доклады и сводки — собираются из записей и после удаления текста не покажут")
+    if exports:
+        out("  экспорты в .atlas/export/ (%d) — Атлас их не чистит: удалите их или сделайте экспорт заново" % len(exports))
+    out("Удалить не могу: %sуже отправленное агенту и провайдеру модели; копии вне проекта и резервные копии." % (
         "историю git (эти файлы уже в git); " if tracked else ""))
     if not args.confirm:
         out("Ничего не изменено. Чтобы удалить из Атласа — только по явному «да» владельца: atlas.py redact %s --confirm" % target)
         return EXIT_OK
     marker = "[удалено владельцем %s]" % ru.short_date(ru.now())
+    removed = []
     with store.lock():
+        txs, _ = store.load_transactions()
+        hits = _redact_hits(txs, target)
         by_tx = {}
         for tx, rec in hits:
             by_tx.setdefault(tx["tx"], tx)
-            for k, v in list(rec.get("data", {}).items()):
-                if isinstance(v, str) and not k.endswith("_id") and k not in ("kind", "state", "method", "outcome"):
-                    rec["data"][k] = marker
-                elif isinstance(v, list) and all(isinstance(i, str) for i in v):
-                    rec["data"][k] = [marker] if v else []
-            if rec.get("source", {}).get("quote"):
-                rec["source"]["quote"] = marker
+            rec["data"] = _redact_value(rec.get("data", {}), marker, removed)
+            src = rec.get("source") or {}
+            if src.get("quote"):
+                removed.append(src["quote"])
+                src["quote"] = marker
+            for key in ("delegation",):
+                if isinstance(src.get(key), dict) and src[key].get("quote"):
+                    removed.append(src[key]["quote"])
+                    src[key]["quote"] = marker
         for tx in by_tx.values():
+            # The stored receipt outcome repeats texts of its records.
+            outcome = (tx.get("origin") or {}).get("outcome")
+            if outcome:
+                tx["origin"]["outcome"] = _redact_value(outcome, marker, removed)
             store.rewrite_transaction(tx)
     ctx = Context(store.project, agent_of(args), session_of(args))
     write_core(store, [("redaction", {"target": target, "records": [r["id"] for _, r in hits], "marker": marker},
                         {"type": "owner_message", "quote": "подтверждено командой redact --confirm"})], ctx, via="redact")
-    out("Удалено из Атласа: очищено %s, в журнале оставлен безопасный маркер без самого текста." % ru.count_words(
+    # Check the leftovers in every canonical record, not only in the edited ones.
+    left = set()
+    texts = {t for t in removed if len(t) >= 4}
+    for name in store.tx_files():
+        with open(os.path.join(store.records_dir, name), encoding="utf-8") as fh:
+            body = fh.read()
+        for t in texts:
+            if json.dumps(t, ensure_ascii=False)[1:-1] in body:
+                left.add(name)
+    out("Удалено из Атласа: очищено %s; ID и связи сохранены, в журнале — маркер без самого текста." % ru.count_words(
         len(hits), "запись", "записи", "записей"))
+    if left:
+        out("Тот же текст ещё встречается в других записях: %s — они относятся к другим объектам; "
+            "удалите их отдельно (atlas.py redact <ID>)." % ", ".join(sorted(left)))
+    else:
+        out("Проверка остатков: в записях Атласа этого текста больше нет.")
     out("Если это был действующий ключ или пароль — его стоит сменить: удаление текста не отменяет возможного раскрытия.")
     return EXIT_OK
 

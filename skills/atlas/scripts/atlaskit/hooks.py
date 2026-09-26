@@ -62,8 +62,10 @@ def detect_gaps(store, st, current_sid, fp_now):
     """Find earlier sessions whose capture is incomplete (§6.1, A06, A82).
 
     Only observable facts are used: a session with file changes but no end
-    of answer recorded; a session that changed files and left no records;
-    files changed after the last recorded session. Returns new gap records.
+    of answer recorded; files that changed after the session's last confirmed
+    record (its checkpoint) — an early record does not cover later work (R09);
+    files changed after the last recorded session. These are mismatches of
+    observed boundaries, not proof of what was said. Returns new gap records.
     """
     found = []
     manifests = [m for m in _all_session_manifests(store) if m.get("id") != current_sid]
@@ -86,8 +88,11 @@ def detect_gaps(store, st, current_sid, fp_now):
         if not m.get("stops"):
             if (start_fp and now_hash and start_fp != now_hash) or (not start_fp and wrote):
                 what, why = "no_stop", "хук конца ответа не сработал или сессия оборвалась"
-        elif not wrote and start_fp and last_fp and start_fp != last_fp:
-            what, why = "no_records", "файлы менялись, а записей нет"
+        elif last_fp and ((st.checkpoints.get(sid) or {}).get("fingerprint") or {}).get("hash", start_fp) != last_fp:
+            if wrote:
+                what, why = "tail", "после последней записи файлы менялись — эта часть работы не записана"
+            else:
+                what, why = "no_records", "файлы менялись, а записей нет"
         elif is_latest and last_fp and now_hash and last_fp != now_hash:
             what, why = "changes_outside", "после неё файлы менялись вне записанных сессий"
         if what:
@@ -105,6 +110,21 @@ def gap_sentence(g):
     if g["what"] == "changes_outside":
         return "После сессии %s (%s) файлы менялись вне записанных сессий. Могу восстановить то, что видно в изменениях файлов." % (day, agent)
     return "Сессия %s (%s) записана частично: %s. Могу восстановить то, что видно в изменениях файлов." % (day, agent, g["why"])
+
+
+def report_gap_lines(st, new_gaps=()):
+    """Everything unresolved stays visible to the owner (R10): new gaps as a
+    full sentence, older unresolved ones as a short reminder. Showing a gap
+    once does not resolve it."""
+    new_ids = {g["gap_id"] for g in new_gaps}
+    lines = [gap_sentence(g) for g in new_gaps]
+    old = [g for g in st.open_gaps() if g["id"] not in new_ids]
+    if old:
+        when = ru.parse_ts(old[0].get("started_at"))
+        day = ru.words_on(when) if when else "в прошлой сессии"
+        lines.append("Ещё не восстановлено: сессия %s записана частично%s — «восстанови, что можно»." % (
+            day, (" и ещё %d" % (len(old) - 1)) if len(old) > 1 else ""))
+    return lines
 
 
 def gap_unknown_lines(st):
@@ -150,7 +170,7 @@ def session_start_output(store, sid, agent, source, mode, command):
         text = ("Атлас: записи повреждены начиная с %s — %s. Показано состояние до этой записи; "
                 "новые записи не делаются. Скажите «проверь Атлас»." % (problem["file"], problem["why"]))
         return {"report": text, "brief": text, "manifest": {}}
-    gap_lines = [gap_sentence(g) for g in new_gaps]
+    gap_lines = report_gap_lines(st, new_gaps)
     brief, manifest = build_brief(st, command, sid, st.last_tx, mode, gaps=gap_unknown_lines(st))
     briefs = store.load_local(os.path.join("manifests", "briefs.json"))
     seen = {d: rev for d, rev in manifest["decisions"].items()}

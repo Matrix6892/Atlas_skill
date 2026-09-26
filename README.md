@@ -169,4 +169,4 @@ docs/                  ТЗ v0.7 и решения этапа M0
 cd tests && python3 -m unittest -v
 ```
 
-Тесты проходят на Python 3.8, 3.10, 3.11, 3.12 и 3.13.
+92 теста, включая регрессии внешнего аудита (`tests/test_review_regressions.py`). Проходят на Python 3.8, 3.10, 3.11, 3.12 и 3.13; на GitHub их запускает `.github/workflows/tests.yml`.

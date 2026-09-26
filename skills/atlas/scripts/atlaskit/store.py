@@ -49,24 +49,22 @@ def sha256_text(text):
 
 
 def find_project(start=None):
-    """Walk up from `start` to the directory that holds `.atlas/`."""
+    """Walk up to the directory that holds `.atlas/`.
+
+    An explicit place (argument, then ATLAS_PROJECT_DIR / CLAUDE_PROJECT_DIR)
+    is a hard limit: if Atlas is not there, the answer is «not found», never
+    another project from the current directory (R11). Only without any
+    explicit place does the search start from the current directory."""
     env = os.environ.get("ATLAS_PROJECT_DIR") or os.environ.get("CLAUDE_PROJECT_DIR")
-    candidates = []
-    if start:
-        candidates.append(os.path.abspath(start))
-    elif env:
-        candidates.append(os.path.abspath(env))
-    candidates.append(os.getcwd())
-    for base in candidates:
-        cur = base
-        while True:
-            if os.path.isdir(os.path.join(cur, ATLAS_DIR)):
-                return cur
-            parent = os.path.dirname(cur)
-            if parent == cur:
-                break
-            cur = parent
-    return None
+    base = os.path.abspath(start or env or os.getcwd())
+    cur = base
+    while True:
+        if os.path.isdir(os.path.join(cur, ATLAS_DIR)):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return None
+        cur = parent
 
 
 class Store:
@@ -236,10 +234,11 @@ class WriterLock:
     def __enter__(self):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         deadline = time.time() + self.timeout
+        self.token = "%d %f %s" % (os.getpid(), time.time(), secrets.token_hex(8))
         while True:
             try:
                 self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.write(self.fd, ("%d %f" % (os.getpid(), time.time())).encode())
+                os.write(self.fd, self.token.encode())
                 return self
             except OSError as exc:
                 if exc.errno != errno.EEXIST:
@@ -255,27 +254,37 @@ class WriterLock:
                 time.sleep(0.05)
 
     def _stale(self):
+        """A lock is stale only when its owner process is gone. Age alone never
+        takes the lock from a live (maybe slow) writer (R13)."""
         try:
             with open(self.path) as fh:
-                pid_s, ts_s = fh.read().split()
-            pid, ts = int(pid_s), float(ts_s)
-        except (OSError, ValueError):
+                parts = fh.read().split()
+            pid = int(parts[0])
+        except (OSError, ValueError, IndexError):
+            # Unreadable owner (e.g. a crash between create and write): only
+            # an old file is treated as abandoned.
             try:
                 return time.time() - os.path.getmtime(self.path) > self.STALE_SECONDS
             except OSError:
                 return True
-        if time.time() - ts > self.STALE_SECONDS:
-            return True
         return not pid_alive(pid)
 
     def __exit__(self, *exc):
         if self.fd is not None:
             os.close(self.fd)
             self.fd = None
+        # Remove the lock only if it is still ours: never delete a lock that
+        # another writer took over.
         try:
-            os.unlink(self.path)
+            with open(self.path) as fh:
+                mine = fh.read() == self.token
         except OSError:
-            pass
+            mine = False
+        if mine:
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass
 
 
 def pid_alive(pid):
@@ -357,6 +366,16 @@ def _is_artifact(path):
             or parts[-1].endswith(ARTIFACT_SUFFIXES))
 
 
+def _mode_of(path):
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return "?"
+    if os.path.islink(path):
+        return "120000"
+    return "100755" if st.st_mode & 0o111 else "100644"
+
+
 def _blob_id(path):
     """git's blob id of a file's current content (content identity)."""
     try:
@@ -380,6 +399,8 @@ def worktree_fingerprint(project):
     if _git(project, "rev-parse", "--is-inside-work-tree") is None:
         return None
     head = (_git(project, "rev-parse", "HEAD") or "no-commit").strip()
+    # path → "mode blob": the executable bit changes behaviour even when the
+    # bytes are the same (R12).
     files = {}
     staged = _git(project, "ls-files", "-s", "-z") or ""
     for entry in staged.split("\0"):
@@ -388,7 +409,7 @@ def worktree_fingerprint(project):
         meta, path = entry.split("\t", 1)
         parts = meta.split()
         if len(parts) >= 3 and parts[2] == "0":
-            files[path] = parts[1]
+            files[path] = "%s %s" % (parts[0], parts[1])
         else:
             files[path] = None  # merge conflict: take the worktree content
     changed = (_git(project, "diff", "--name-only", "-z") or "").split("\0")
@@ -400,7 +421,7 @@ def worktree_fingerprint(project):
             continue
         full = os.path.join(project, path)
         if os.path.lexists(full):
-            files[path] = _blob_id(full)
+            files[path] = "%s %s" % (_mode_of(full), _blob_id(full))
         else:
             files.pop(path, None)
         dirty = True

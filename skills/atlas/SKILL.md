@@ -1,7 +1,25 @@
 ---
 name: atlas
 description: "Атлас — память и карта проекта, которую ведёт агент, а читает владелец (этап M0, всё в чате). Использовать, когда в проекте есть папка .atlas/ или владелец говорит «подключи Атлас», «где мы?», «что от меня нужно?», «покажи, что готово», «что с <темой>?», «в сторону: …», «мы же решили…», «проверил, работает», «принимаю», «ты неверно понял», «давай разберём идеи», «на сегодня всё», «отключи Атлас»; а также после каждого значимого шага работы (сделано, решено, проверено, отложено, не получилось), чтобы оставить короткую запись."
-allowed-tools: Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py *)
+allowed-tools:
+  - Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py report *)
+  - Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py overview *)
+  - Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py needs *)
+  - Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py result *)
+  - Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py topic *)
+  - Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py parking *)
+  - Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py decisions *)
+  - Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py find *)
+  - Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py brief *)
+  - Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py show *)
+  - Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py write *)
+  - Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py rules *)
+  - Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py scan *)
+  - Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py changes *)
+  - Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py start *)
+  - Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py help *)
+  - Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py doctor *)
+  - Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py mood *)
 ---
 
 # Атлас (этап M0)
@@ -11,8 +29,10 @@ allowed-tools: Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py *)
 Команда (дальше она называется `atlas`):
 
 ```
-python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py --session ${CLAUDE_SESSION_ID} <команда>
+python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py <команда> --session ${CLAUDE_SESSION_ID}
 ```
+
+Подкоманда всегда идёт сразу после `atlas.py`, а `--session` — после неё. Без запроса разрешения выполняются только операции памяти: чтение, экраны и `write`. `check` запускает команду проекта, а `connect`, `disconnect`, `redact` и `export` меняют файлы проекта. Поэтому на них Claude Code спросит владельца, так и задумано.
 
 **Codex, opencode и другие агенты.** Если `${CLAUDE_SKILL_DIR}` в тексте не заменился на путь, это папка, где лежит этот SKILL.md: команда — `python3 <эта папка>/scripts/atlas.py`. Часть `--session ${CLAUDE_SESSION_ID}` опусти (Codex передаёт идентификатор сессии сам). Не Claude Code и не Codex — добавляй `--agent <имя>`, например `--agent opencode`. Хуков Атласа у этих агентов нет, поэтому в начале работы сам выполни `atlas start` и покажи доклад.
 
@@ -68,7 +88,7 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py --session ${CLAUDE_SESSION_ID} <к�
    ]}
    ```
 
-2. Выполни `python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py --session ${CLAUDE_SESSION_ID} write --file .atlas/.local/inbox/<короткое-имя>.json`. После записи писатель удалит файл сам.
+2. Выполни `python3 ${CLAUDE_SKILL_DIR}/scripts/atlas.py write --file .atlas/.local/inbox/<короткое-имя>.json --session ${CLAUDE_SESSION_ID}`. После записи писатель удалит файл сам.
 
 Heredoc с JSON в командной строке не используй: Claude Code блокирует такие команды как подозрительные.
 
@@ -82,7 +102,7 @@ Heredoc с JSON в командной строке не используй: Clau
 atlas check --thread "Вход через Google" --criteria cr-… --env "на компьютере" -- npm test
 ```
 
-Порядок такой: сначала `result.present`, потом `check`, потому что проверка привязана к версии результата. Твой рассказ «тесты прошли» ядро записывает как «со слов агента», и «проверено» от него не растёт. Поле `trusted`, `method: automated_run` или файл «test passed» этого не меняют (B.2). В `--criteria` указывай только то, что команда действительно проверяет.
+Порядок такой: сначала `result.present`, потом `check`, потому что проверка привязана к версии результата. `check` сначала проверяет, что условия входят в версию и Атлас включён, и только потом запускает команду. Секреты из команды не сохраняются. На `check` Claude Code спрашивает разрешение владельца: команда проекта — это исполнение кода. Твой рассказ «тесты прошли» ядро записывает как «со слов агента», и «проверено» от него не растёт. Поле `trusted`, `method: automated_run` или файл «test passed» этого не меняют (B.2). В `--criteria` указывай только то, что команда действительно проверяет.
 
 ## 5. Экраны, которые строишь ты
 
