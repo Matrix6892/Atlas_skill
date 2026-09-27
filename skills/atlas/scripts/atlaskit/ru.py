@@ -16,6 +16,7 @@ THREAD_STATE = {
     "active": "в работе",
     "paused": "на паузе",
     "presented": "результат предъявлен",
+    "closed": "согласованное принято",
     "frozen": "заморожено",
     "released": "отпущено",
 }
@@ -24,6 +25,7 @@ AGENT_NAMES = {
     "claude-code": "Claude Code",
     "claude": "Claude Code",
     "codex": "Codex",
+    "opencode": "opencode",
 }
 
 # Words from §4.2 that get a one-time explanation on first appearance in a session.

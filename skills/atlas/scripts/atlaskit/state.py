@@ -40,6 +40,7 @@ class State:
         self.recoveries = []
         self.redactions = []
         self.receipts = {}
+        self.checkpoints = {}
         self.records = []
         self.errors = set()
         self.last_tx = 0
@@ -60,7 +61,13 @@ class State:
         origin = tx.get("origin", {})
         key = origin.get("receipt_key")
         if key:
-            self.receipts[key] = {"hash": origin.get("receipt_hash"), "tx": tx["tx"]}
+            self.receipts[key] = {"hash": origin.get("receipt_hash"), "tx": tx["tx"],
+                                  "outcome": origin.get("outcome")}
+        sid = origin.get("session")
+        if sid and origin.get("via") in ("write", "check"):
+            # Last confirmed checkpoint of a session and the files it covered
+            # (capture boundary, R09): a later change without a record is a tail.
+            self.checkpoints[sid] = {"tx": tx["tx"], "fingerprint": origin.get("fingerprint")}
         for rec in tx.get("records", []):
             meta = {
                 "tx": tx["tx"],
@@ -413,8 +420,12 @@ class State:
             obj = self.lookup(target)
             if obj is not None:
                 for k, v in (d.get("edit") or {}).items():
-                    obj[k] = v
+                    if isinstance(v, str):
+                        obj[k] = v
                 obj["corrected_by"] = d["correction_id"]
+                obj["corrected_source"] = rec.get("source")
+                if d.get("substantive") and "scope_rev" in obj:
+                    obj["scope_rev"] += 1
                 self._touch(obj, meta)
 
     def _on_session_start(self, d, rec, meta):
@@ -486,12 +497,33 @@ class State:
         return max(vs) if vs else 0
 
     def view_state(self, t):
-        """Stored state, except `presented` derived from the latest result."""
+        """Stored state, except two states derived from the latest result:
+        `presented` (waiting for the owner) and `closed` (everything agreed
+        is accepted — R14). Neither is stored; both come from the axes."""
         if t["state"] == "active":
             r = self.latest_result(t["id"])
             if r and self.result_awaiting(r):
                 return "presented"
+            if r and self.scope_closed(t, r):
+                return "closed"
         return t["state"]
+
+    def scope_closed(self, t, r):
+        """The agreed scope is closed: every current readiness condition of
+        the topic is in the latest version and accepted (not rejected), and no
+        question about the topic is open. A new condition or a rejection
+        reopens the work. Acceptance still says nothing about checks (B.1)."""
+        crits = self.thread_criteria(t)
+        if not crits or r.get("withdrawn") or self.result_failed(r):
+            return False
+        in_version = {c["id"] for c in r["criteria"]}
+        for c in crits:
+            if c["id"] not in in_version:
+                return False
+            acc = self.criterion_acceptance(r, c["id"])
+            if not acc or acc["outcome"] == "rejected":
+                return False
+        return not any(d.get("thread_id") == t["id"] for d in self.open_decisions())
 
     def wip_count(self, exclude=None):
         return sum(1 for t in self.live_threads()
@@ -530,7 +562,7 @@ class State:
                 agent_only = v
                 continue
             vfp = (v.get("fingerprint") or {}).get("hash")
-            if rfp and vfp and rfp != vfp:
+            if v.get("changed_during_run") or (rfp and vfp and rfp != vfp):
                 # The code changed after the result was presented: the
                 # observation stays with the tested state (B.5).
                 mismatch = v
@@ -658,7 +690,7 @@ class State:
             if d.get("risk", "normal") != "normal":
                 prio = 0
             elif d.get("urgency") == "blocking":
-                prio = 2
+                prio = 1
             elif d.get("deadline") or d.get("urgency") == "deadline":
                 prio = 3
             else:
@@ -670,7 +702,7 @@ class State:
             if self.view_state(t) != "presented":
                 continue
             r = self.latest_result(t["id"])
-            items.append({"type": "result", "prio": 1, "obj": r, "thread": t, "order": r["created_tx"]})
+            items.append({"type": "result", "prio": 2, "obj": r, "thread": t, "order": r["created_tx"]})
         for r in self.proposed_rules():
             items.append({"type": "rule", "prio": 5, "obj": r, "order": r["created_tx"]})
         items.sort(key=lambda i: (i["prio"], i["order"]))

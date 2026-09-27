@@ -48,13 +48,15 @@ def detect_hooks_mode():
 
 
 def agents_block():
-    return """## Атлас — память проекта (ручной режим)
-В этом проекте работает Атлас. У этого агента нет хуков Атласа — действует ручной порядок записи, одна сессия за раз:
-1. В начале работы: `%s start --agent codex` — покажи владельцу доклад из вывода.
-2. После значимого шага — запись: положи квитанцию JSON в `.atlas/.local/inbox/<имя>.json` и выполни `%s write --agent codex --file .atlas/.local/inbox/<имя>.json` (формат: `%s help receipts`).
-3. Владелец сказал «на сегодня всё» — запиши закладку (операция `bookmark.save`).
-«Мы же решили…» — искать решение в записях (`%s decisions`); новое решение только из явных слов владельца.
-Деньги, публикация, настоящие данные — только по явному «да» владельца. Файлы `.atlas/` руками не править.""" % (
+    return """## Атлас — память проекта (Codex, opencode и другие агенты без хуков Атласа)
+В этом проекте работает Атлас: память и карта проекта. Если у тебя есть скилл `atlas` — следуй ему. Порядок, одна сессия за раз:
+1. В начале работы выполни `%s start` и покажи владельцу доклад из вывода как есть.
+2. После значимого шага (сделано, решено, проверено, отложено, не получилось) — запись: положи квитанцию JSON в `.atlas/.local/inbox/<имя>.json` и выполни `%s write --file .atlas/.local/inbox/<имя>.json`. Формат квитанций: `%s help receipts`.
+3. Владелец сказал «на сегодня всё» — запиши закладку (операция `bookmark.save`) и покажи экран из вывода.
+Codex Атлас узнаёт сам; другим агентам добавлять к командам `--agent <имя>`, например `--agent opencode`.
+«Мы же решили…» — искать решение в записях (`%s find <слова>`); новое решение только из явных слов владельца.
+Деньги, публикация, настоящие данные — только по явному «да» владельца. Файлы `.atlas/` руками не править (кроме квитанций в `.atlas/.local/inbox/`).
+Если команда не найдена — скилл Атласа переустановлен в другое место: выполни `atlas.py connect` из новой папки скилла.""" % (
         (command_line(),) * 4)
 
 
@@ -182,7 +184,7 @@ def _git_ignored(project, rel):
 
 
 # ----------------------------------------------------------------------
-def connect(project, name=None, hooks="auto", agents_md=False):
+def connect(project, name=None, hooks="auto", agents_md=False, claude_md=True):
     from .ops import Context, write_core  # local import to avoid a cycle
 
     store = Store(project)
@@ -202,9 +204,11 @@ def connect(project, name=None, hooks="auto", agents_md=False):
             cfg["enabled"] = True
             store.save_config(cfg)
             changes.append("снова включил запись в .atlas/ (данные были сохранены)")
-    action = _upsert_block(os.path.join(project, "CLAUDE.md"), CLAUDE_BLOCK)
-    if action != "без изменений":
-        changes.append("%s блок Атласа в CLAUDE.md (инструкции агента)" % action)
+    claude_path = os.path.join(project, "CLAUDE.md")
+    if claude_md or os.path.exists(claude_path):
+        action = _upsert_block(claude_path, CLAUDE_BLOCK)
+        if action != "без изменений":
+            changes.append("%s блок Атласа в CLAUDE.md (инструкции агента)" % action)
     if agents_md:
         action = _upsert_block(os.path.join(project, "AGENTS.md"), agents_block())
         if action != "без изменений":
@@ -220,8 +224,10 @@ def connect(project, name=None, hooks="auto", agents_md=False):
     elif mode == "plugin":
         remove_project_hooks(project)
     local = store.load_local("install.json")
-    local.update({"hooks_mode": mode, "script": script_path(), "installed_at": ru.now_iso(),
-                  "atlas_version": VERSION, "agents_md": bool(agents_md or local.get("agents_md"))})
+    if mode != "keep":
+        local.update({"hooks_mode": mode, "script": script_path()})
+    local.update({"installed_at": ru.now_iso(), "atlas_version": VERSION,
+                  "agents_md": bool(agents_md or local.get("agents_md"))})
     store.save_local("install.json", local)
     return {"fresh": fresh, "changes": changes, "mode": mode}
 
